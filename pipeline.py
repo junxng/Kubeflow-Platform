@@ -1,11 +1,9 @@
-from typing import Dict, List
 from kfp import dsl
 from kfp import compiler
 import kfp
 from kfp.dsl import Input, Output, Dataset, Model, component
-import json
 import os 
- 
+
 # Step 1: Load Dataset
 @dsl.component(base_image="python:3.12")
 def load_data(output_csv: Output[Dataset]):
@@ -35,13 +33,8 @@ def preprocess_data(input_csv: Input[Dataset], output_train: Output[Dataset], ou
     # Load dataset
     df = pd.read_csv(input_csv.path)
 
-    # Debug: Check for NaN values
-    print("Initial dataset shape:", df.shape)
-    print("Missing values before preprocessing:\n", df.isnull().sum())
-
     # Handle missing values
     if df.isnull().values.any():
-        print("Missing values detected. Handling them...")
         df = df.dropna()  # Drop rows with any NaN values
     
     # Validate that there are no NaNs in the target column
@@ -57,28 +50,15 @@ def preprocess_data(input_csv: Input[Dataset], output_train: Output[Dataset], ou
     # Train-test split
     X_train, X_test, y_train, y_test = train_test_split(scaled_features, target, test_size=0.2, random_state=42)
 
-    # Debug: Validate splits
-    print("Shapes after train-test split:")
-    print("X_train:", X_train.shape, "X_test:", X_test.shape) 
-    print("y_train:", y_train.shape, "y_test:", y_test.shape)
-    print("Missing values in y_train:", y_train.isnull().sum())
-
     # Ensure no NaNs in the split data
     assert not y_train.isnull().any(), "y_train contains NaN values."
     assert not y_test.isnull().any(), "y_test contains NaN values."
 
     # Create DataFrames for train and test sets
     X_train_df = pd.DataFrame(X_train, columns=features.columns)
-    print("X_train_df:", X_train_df) 
-
     y_train_df = pd.DataFrame(y_train) 
-    print("y_train_df: ", y_train_df)  
-
     X_test_df = pd.DataFrame(X_test, columns=features.columns)
-    print("X_test_df:", X_test_df) 
-
     y_test_df = pd.DataFrame(y_test) 
-    print("y_test_df: ", y_test_df) 
 
     # Save processed train and test data
     X_train_df.to_csv(output_train.path, index=False)  
@@ -117,17 +97,10 @@ def train_model(
 
     # Load training data
     train_df = pd.read_csv(train_data.path)
-    print("Shape of train_df:", train_df.shape)
     X_train = train_df 
 
     y_train = pd.read_csv(ytrain_data.path)
-    print("Shape of ytrain_df:", y_train.shape)
-    y_train = y_train.values.ravel()  # Fix the column-vector warning
-
-    # Debug: Validate splits
-    print("Shapes of X_train and y_train: ")
-    print("X_train:", X_train.shape)
-    print("y_train:", y_train.shape) 
+    y_train = y_train.values.ravel()  # Fix the column-vector warning 
 
     # Train model
     model = LogisticRegression()
