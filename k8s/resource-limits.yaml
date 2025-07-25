@@ -1,0 +1,123 @@
+# Resource Limits and Monitoring Configuration
+# Production-ready resource management and monitoring setup
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: resource-limits-config
+  namespace: kubeflow
+data:
+  default-resources.json: |
+    {
+      "training": {
+        "requests": {
+          "memory": "1Gi",
+          "cpu": "500m"
+        },
+        "limits": {
+          "memory": "4Gi",
+          "cpu": "2000m"
+        }
+      },
+      "serving": {
+        "requests": {
+          "memory": "512Mi",
+          "cpu": "250m"
+        },
+        "limits": {
+          "memory": "2Gi",
+          "cpu": "1000m"
+        }
+      },
+      "data-processing": {
+        "requests": {
+          "memory": "2Gi",
+          "cpu": "1000m"
+        },
+        "limits": {
+          "memory": "8Gi",
+          "cpu": "4000m"
+        }
+      }
+    }
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: monitoring-config
+  namespace: kubeflow
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'kubeflow-pipelines'
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names:
+                - kubeflow
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+
+---
+# Horizontal Pod Autoscaler for Model Serving
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: iris-model-hpa
+  namespace: kubeflow
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iris-model-serving
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Pod Disruption Budget for High Availability
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: iris-model-pdb
+  namespace: kubeflow
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: iris-model-serving
+
+---
+# Resource Quotas
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: ml-pipeline-quota
+  namespace: kubeflow
+spec:
+  hard:
+    requests.cpu: "10"
+    requests.memory: 20Gi
+    limits.cpu: "20"
+    limits.memory: 40Gi
+    persistentvolumeclaims: "5"
+    pods: "20"
+    services: "10"

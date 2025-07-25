@@ -1,0 +1,331 @@
+# Production-Ready Kubernetes Deployment Manifests
+# Complete deployment with security, monitoring, and HA configurations
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ml-pipeline
+  labels:
+    name: ml-pipeline
+    istio-injection: enabled
+
+---
+# Production Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ml-pipeline-sa
+  namespace: ml-pipeline
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/kubeflow-ml-pipeline-role
+
+---
+# ConfigMap for pipeline configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pipeline-config
+  namespace: ml-pipeline
+data:
+  model_name: "iris-classifier"
+  s3_bucket: "your-ml-bucket-name"
+  model_threshold: "0.8"
+  max_replicas: "10"
+  min_replicas: "2"
+
+---
+# Persistent Volume Claim for model storage
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-storage-pvc
+  namespace: ml-pipeline
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: gp2
+
+---
+# Training Job Deployment
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: iris-training-job
+  namespace: ml-pipeline
+spec:
+  template:
+    metadata:
+      labels:
+        app: iris-training
+    spec:
+      serviceAccountName: ml-pipeline-sa
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: training
+        image: python:3.9-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            pip install scikit-learn pandas boto3
+            python -c "
+            import joblib
+            from sklearn.datasets import load_iris
+            from sklearn.model_selection import train_test_split
+            from sklearn.ensemble import RandomForestClassifier
+            import boto3
+            import os
+            
+            # Load iris dataset
+            iris = load_iris()
+            X_train, X_test, y_train, y_test = train_test_split(
+                iris.data, iris.target, test_size=0.2, random_state=42
+            )
+            
+            # Train model
+            model = RandomForestClassifier(n_estimators=100, random_state=42)
+            model.fit(X_train, y_train)
+            
+            # Save model
+            joblib.dump(model, '/models/iris_model.pkl')
+            
+            # Upload to S3
+            s3 = boto3.client('s3')
+            s3.upload_file('/models/iris_model.pkl', 
+                          os.environ['S3_BUCKET'], 
+                          'models/iris_model.pkl')
+            print('Model trained and saved successfully')
+            "
+        env:
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: pipeline-config
+              key: s3_bucket
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-storage-pvc
+
+---
+# Model Serving Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: iris-model-serving
+  namespace: ml-pipeline
+  labels:
+    app: iris-model-serving
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: iris-model-serving
+  template:
+    metadata:
+      labels:
+        app: iris-model-serving
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ml-pipeline-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: model-server
+        image: python:3.9-slim
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            pip install flask scikit-learn boto3 prometheus-client
+            python -c "
+            from flask import Flask, request, jsonify
+            import joblib
+            import boto3
+            import os
+            from prometheus_client import Counter, Histogram, generate_latest
+            
+            app = Flask(__name__)
+            
+            # Download model from S3
+            s3 = boto3.client('s3')
+            s3.download_file(os.environ['S3_BUCKET'], 'models/iris_model.pkl', '/models/iris_model.pkl')
+            model = joblib.load('/models/iris_model.pkl')
+            
+            # Prometheus metrics
+            REQUEST_COUNT = Counter('model_requests_total', 'Total model requests')
+            REQUEST_LATENCY = Histogram('model_request_duration_seconds', 'Request latency')
+            
+            @app.route('/predict', methods=['POST'])
+            def predict():
+                REQUEST_COUNT.inc()
+                with REQUEST_LATENCY.time():
+                    data = request.json
+                    prediction = model.predict([data['features']])
+                    return jsonify({'prediction': int(prediction[0])})
+            
+            @app.route('/health')
+            def health():
+                return jsonify({'status': 'healthy'})
+            
+            @app.route('/metrics')
+            def metrics():
+                return generate_latest()
+            
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=8080)
+            "
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+        - name: S3_BUCKET
+          valueFrom:
+            configMapKeyRef:
+              name: pipeline-config
+              key: s3_bucket
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        volumeMounts:
+        - name: tmp-volume
+          mountPath: /tmp
+      volumes:
+      - name: tmp-volume
+        emptyDir: {}
+
+---
+# Service for Model Serving
+apiVersion: v1
+kind: Service
+metadata:
+  name: iris-model-serving
+  namespace: ml-pipeline
+  labels:
+    app: iris-model-serving
+spec:
+  selector:
+    app: iris-model-serving
+  ports:
+  - port: 80
+    targetPort: 8080
+    name: http
+  type: ClusterIP
+
+---
+# Horizontal Pod Autoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: iris-model-hpa
+  namespace: ml-pipeline
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: iris-model-serving
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+
+---
+# Pod Disruption Budget
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: iris-model-pdb
+  namespace: ml-pipeline
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: iris-model-serving
+
+---
+# Ingress for external access
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: iris-model-ingress
+  namespace: ml-pipeline
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+spec:
+  tls:
+  - hosts:
+    - ml-api.yourdomain.com
+    secretName: iris-model-tls
+  rules:
+  - host: ml-api.yourdomain.com
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: iris-model-serving
+            port:
+              number: 80

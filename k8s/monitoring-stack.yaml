@@ -1,0 +1,160 @@
+# Complete Monitoring and Alerting Stack
+# Prometheus, Grafana, and custom ML metrics
+
+---
+# Service Monitor for Kubeflow Pipelines
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kubeflow-pipeline-monitor
+  namespace: kubeflow
+  labels:
+    app: kubeflow-pipelines
+spec:
+  selector:
+    matchLabels:
+      app: kubeflow-pipelines
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+
+---
+# PrometheusRule for ML-specific alerts
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: ml-pipeline-alerts
+  namespace: kubeflow
+spec:
+  groups:
+  - name: ml-pipeline.rules
+    rules:
+    - alert: HighModelLatency
+      expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m])) > 0.5
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High model serving latency detected"
+        description: "95th percentile latency is {{ $value }}s"
+    
+    - alert: ModelAccuracyDrop
+      expr: model_accuracy < 0.8
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Model accuracy below threshold"
+        description: "Current accuracy is {{ $value }}"
+    
+    - alert: PipelineFailureRate
+      expr: rate(kubeflow_pipeline_failures_total[5m]) > 0.1
+      for: 3m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High pipeline failure rate"
+        description: "Failure rate is {{ $value }} failures/minute"
+
+---
+# Grafana Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-ml-pipeline
+  namespace: kubeflow
+  labels:
+    grafana_dashboard: "1"
+data:
+  ml-pipeline-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "ML Pipeline Monitoring",
+        "panels": [
+          {
+            "title": "Model Accuracy",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "model_accuracy",
+                "legendFormat": "Accuracy"
+              }
+            ]
+          },
+          {
+            "title": "Request Latency",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))",
+                "legendFormat": "95th percentile"
+              }
+            ]
+          },
+          {
+            "title": "Pipeline Success Rate",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "rate(kubeflow_pipeline_success_total[5m]) / rate(kubeflow_pipeline_runs_total[5m])",
+                "legendFormat": "Success Rate"
+              }
+            ]
+          }
+        ]
+      }
+    }
+
+---
+# Custom ML Metrics Exporter
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ml-metrics-exporter
+  namespace: kubeflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ml-metrics-exporter
+  template:
+    metadata:
+      labels:
+        app: ml-metrics-exporter
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: ml-pipeline-sa
+      containers:
+      - name: metrics-exporter
+        image: prometheus/python-exporter:latest
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "50m"
+          limits:
+            memory: "256Mi"
+            cpu: "100m"
+        env:
+        - name: MODEL_ENDPOINT
+          value: "http://iris-model-serving:8080"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ml-metrics-exporter
+  namespace: kubeflow
+  labels:
+    app: ml-metrics-exporter
+spec:
+  selector:
+    app: ml-metrics-exporter
+  ports:
+  - port: 8080
+    targetPort: 8080

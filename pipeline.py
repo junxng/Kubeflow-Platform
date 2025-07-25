@@ -19,7 +19,32 @@ def load_data(output_csv: Output[Dataset]):
     # Save the dataset to the output artifact path
     df.to_csv(output_csv.path, index=False)
 
-# Step 2: Preprocess Data
+# Step 2: Validate Dataset
+@dsl.component(base_image="python:3.12")
+def validate_dataset(
+    input_csv: Input[Dataset],
+    report: Output[Dataset]
+):
+    import pandas as pd
+    
+    df = pd.read_csv(input_csv.path)
+    
+    # Basic validation checks
+    report_str = ""
+    if df.isnull().values.any():
+        report_str += "Dataset contains missing values.\\n"
+    else:
+        report_str += "Dataset has no missing values.\\n"
+        
+    if 'target' not in df.columns:
+        report_str += "Dataset is missing the 'target' column.\\n"
+    else:
+        report_str += "Dataset has the 'target' column.\\n"
+        
+    with open(report.path, 'w') as f:
+        f.write(report_str)
+
+# Step 3: Preprocess Data
 @dsl.component(base_image="python:3.12")
 def preprocess_data(input_csv: Input[Dataset], output_train: Output[Dataset], output_test: Output[Dataset], 
                     output_ytrain: Output[Dataset], output_ytest: Output[Dataset]):
@@ -67,7 +92,36 @@ def preprocess_data(input_csv: Input[Dataset], output_train: Output[Dataset], ou
     y_train_df.to_csv(output_ytrain.path, index=False)  
     y_test_df.to_csv(output_ytest.path, index=False) 
 
-# Step 3: Train Model
+# Step 4: Hyperparameter Tuning
+@dsl.component(
+    base_image="python:3.12",
+    packages_to_install=["pandas", "scikit-learn", "joblib"]
+)
+def hyperparameter_tuning(
+    train_data: Input[Dataset],
+    ytrain_data: Input[Dataset],
+    best_model: Output[Model]
+):
+    import pandas as pd
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import GridSearchCV
+    from joblib import dump
+
+    X_train = pd.read_csv(train_data.path)
+    y_train = pd.read_csv(ytrain_data.path).values.ravel()
+
+    param_grid = {
+        'C': [0.1, 1.0, 10.0],
+        'solver': ['liblinear', 'saga']
+    }
+    
+    model = LogisticRegression()
+    grid_search = GridSearchCV(model, param_grid, cv=5)
+    grid_search.fit(X_train, y_train)
+    
+    dump(grid_search.best_estimator_, best_model.path)
+
+# Step 5: Train Model
 @dsl.component(
     base_image="python:3.12",
     packages_to_install=[
@@ -79,36 +133,40 @@ def preprocess_data(input_csv: Input[Dataset], output_train: Output[Dataset], ou
     ]
 )
 def train_model(
-    train_data: Input[Dataset], 
-    ytrain_data: Input[Dataset], 
+    model_input: Input[Model],
     model_output: Output[Model],
     aws_access_key_id: str,
     aws_secret_access_key: str,
     s3_bucket: str,
     s3_key: str
 ) -> str:
-    import pandas as pd
-    from sklearn.linear_model import LogisticRegression
-    from joblib import dump
+    from joblib import load, dump
     import boto3
     import os
     from datetime import datetime
     import json
+    import re
 
-    # Load training data
-    train_df = pd.read_csv(train_data.path)
-    X_train = train_df 
+    # Validate required parameters
+    if not aws_access_key_id or not aws_secret_access_key:
+        raise ValueError("AWS credentials are required. Use Kubernetes secrets or IAM roles.")
+    if not s3_bucket or not s3_key:
+        raise ValueError("S3 bucket and key are required parameters.")
+    
+    # Validate S3 bucket name format
+    if not re.match(r'^[a-z0-9][a-z0-9.-]*[a-z0-9]$', s3_bucket):
+        raise ValueError("Invalid S3 bucket name format")
+    
+    # Validate S3 key format
+    if not re.match(r'^[a-zA-Z0-9/_-]+$', s3_key):
+        raise ValueError("Invalid S3 key format")
 
-    y_train = pd.read_csv(ytrain_data.path)
-    y_train = y_train.values.ravel()  # Fix the column-vector warning 
-
-    # Train model
-    model = LogisticRegression()
-    model.fit(X_train, y_train)
-
-    # First save model locally
+    # Load the best model from hyperparameter tuning
+    best_model = load(model_input.path)
+    
+    # Save the final model
     local_path = model_output.path
-    dump(model, local_path)
+    dump(best_model, local_path)
     print(f"Model saved locally to: {local_path}")
 
     try:
@@ -149,9 +207,9 @@ def train_model(
         print(f"Error uploading to S3: {str(e)}")
         raise
 
-# Step 4: Evaluate Model
+# Step 6: Evaluate Model
 @dsl.component(base_image="python:3.12")
-def evaluate_model(test_data: Input[Dataset], ytest_data: Input[Dataset], model: Input[Model], metrics_output: Output[Dataset]):
+def evaluate_model(test_data: Input[Dataset], ytest_data: Input[Dataset], model: Input[Model], metrics_output: Output[Dataset]) -> float:
     import subprocess
     subprocess.run(["pip", "install", "pandas", "scikit-learn", "matplotlib", "joblib"], check=True)
 
@@ -179,7 +237,7 @@ def evaluate_model(test_data: Input[Dataset], ytest_data: Input[Dataset], model:
     # Save metrics to a file
     metrics_path = metrics_output.path
     with open(metrics_path, 'w') as f:
-        f.write(f"Accuracy: {accuracy}\n")  # Add accuracy to the metrics file
+        f.write(f"Accuracy: {accuracy}\\n")  # Add accuracy to the metrics file
         f.write(str(report))
 
     # Plot confusion matrix
@@ -190,38 +248,71 @@ def evaluate_model(test_data: Input[Dataset], ytest_data: Input[Dataset], model:
     plt.xlabel('Predicted Label')
     plt.ylabel('True Label')
     plt.savefig(metrics_path.replace('.txt', '.png'))
+    
+    return accuracy
 
+# Step 7: Deploy Model
+@dsl.component(base_image="python:3.12")
+def deploy_model(
+    model_uri: str,
+    deployment_name: str = "iris-classifier"
+):
+    # This is a placeholder for a real deployment process
+    print(f"Deploying model from: {model_uri}")
+    print(f"Deployment name: {deployment_name}")
+    # In a real scenario, this would involve creating a prediction service
+    # (e.g., a REST API with Flask/FastAPI) and deploying it to a serving
+    # environment like Kubernetes or a cloud-based AI platform.
+    pass
 
 # Define the pipeline
 @dsl.pipeline(name="ml-pipeline")
 def ml_pipeline(
-    aws_access_key_id: str = os.getenv('AWS_ACCESS_KEY_ID'),
-    aws_secret_access_key: str = os.getenv('AWS_SECRET_ACCESS_KEY'),
-    s3_bucket: str = "kubeflow-bucket-dungnq49",
-    s3_key: str = "models/iris"
+    aws_access_key_id: str = None,
+    aws_secret_access_key: str = None,
+    s3_bucket: str = None,
+    s3_key: str = None
 ):
     # Step 1: Load Dataset
     load_op = load_data()
 
-    # Step 2: Preprocess Data
+    # Step 2: Validate Dataset
+    validate_op = validate_dataset(
+        input_csv=load_op.outputs["output_csv"]
+    )
+    
+    # Step 3: Preprocess Data
     preprocess_op = preprocess_data(input_csv=load_op.outputs["output_csv"])
+    preprocess_op.after(validate_op)
 
-    # Step 3: Train Model
-    train_op = train_model(
+    # Step 4: Hyperparameter Tuning
+    hpt_op = hyperparameter_tuning(
         train_data=preprocess_op.outputs["output_train"],
-        ytrain_data=preprocess_op.outputs["output_ytrain"],
+        ytrain_data=preprocess_op.outputs["output_ytrain"]
+    )
+
+    # Step 5: Train Model
+    train_op = train_model(
+        model_input=hpt_op.outputs["best_model"],
         aws_access_key_id=aws_access_key_id,
         aws_secret_access_key=aws_secret_access_key,
         s3_bucket=s3_bucket,
         s3_key=s3_key
     )
 
-    # Step 4: Evaluate Model
+    # Step 6: Evaluate Model
     evaluate_op = evaluate_model(
         test_data=preprocess_op.outputs["output_test"],
         ytest_data=preprocess_op.outputs["output_ytest"],
         model=train_op.outputs["model_output"]
     )
+
+    # Step 7: Deploy Model (conditionally)
+    with dsl.Condition(evaluate_op.outputs['Output'] > 0.9): # Example threshold
+        deploy_op = deploy_model(
+            model_uri=train_op.outputs['Output']
+        )
+        deploy_op.after(evaluate_op)
 
 # Compile the pipeline
 if __name__ == "__main__":
